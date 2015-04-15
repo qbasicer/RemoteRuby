@@ -14,6 +14,21 @@ trap("SIGINT") {
 }
 begin
 
+	key = nil
+
+	if (File.exist?("remote.key")) then
+		key = OpenSSL::PKey::RSA.new(File.read("remote.key"))
+		sha1 = Digest::SHA1.hexdigest key.public_key.to_der
+		puts "Loaded key #{sha1}"
+	else
+		puts "Generating new key"
+		key = OpenSSL::PKey::RSA.new(4096)
+		File.open("remote.key", "w"){|f| f.write key.to_pem}
+		sha1 = Digest::SHA1.hexdigest key.public_key.to_der
+		puts "Loaded key #{sha1}"
+	end
+	File.chmod(0600, "remote.key")
+
 	client = Harness::Client.new("localhost", 2000)
 
 	pump = Harness::IOPump.new
@@ -22,9 +37,17 @@ begin
 
 	client.pump = pump
 
-	client.execute(["bash", "-l"])
+	#client.connect_channel(0, Harness::CommandChannelClient.new(0, client))
+	kc = Harness::KeyClient.new(0, client, key)
+	client.connect_channel(0, kc)
 
-	client.connect_channel(0, Harness::CommandChannelClient.new(0, client))
+	kc.start_key_negotiation
+
+	kc.on_connect{
+		client.execute(["bash", "-l"])
+	}
+
+	
 
 
 	pump.run

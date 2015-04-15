@@ -2,6 +2,9 @@ require 'socket'
 require 'json'
 require 'open3'
 require 'pty'
+require 'digest'
+require 'openssl'
+require 'base64'
 
 module Harness
 
@@ -54,6 +57,7 @@ module Harness
 	class Server
 		def initialize(port)
 			@server = TCPServer.new port
+
 			@on_connect = []
 			@verbose = false
 		end
@@ -88,6 +92,147 @@ module Harness
 
 		def to_io
 			@server
+		end
+	end
+
+	class KeyServer
+		def initialize(channel, client)
+			@client = client
+			@dh = OpenSSL::PKey::DH.new(File.read("dh.key"))
+			@dh.generate_key! if @dh.pub_key.nil?
+			@channel = channel
+			@symmkey = nil
+			@iv = nil
+		end
+		def read(channel, indata)
+			data = JSON.parse(indata)
+			if (data["cmd"] == "key") then
+				key = OpenSSL::PKey::RSA.new(data["key"])
+
+				sha1 = Digest::SHA1.hexdigest key.to_der
+
+				lines = File.read("key.allow").split("\n").map{|line| line.strip}
+				allowed = false
+				lines.each{|line|
+					if (line == sha1) then
+						allowed = true
+						break
+					end
+				}
+				raise "Client is not authorized to connect with key #{sha1}, add it to key.allow" unless allowed
+
+				puts "Connection from key #{sha1}"
+
+				cmd = {}
+				cmd["cmd"] = "encrypted"
+				cmd["key"] = sha1
+
+				cipher = OpenSSL::Cipher::AES256.new(:CBC)
+				cipher.encrypt
+
+				params = {}
+				@iv = cipher.random_iv
+				params["iv"] = Base64.encode64(@iv)
+				params["key"] = Base64.encode64(cipher.random_key)
+				params = Base64.encode64(key.public_encrypt(JSON.pretty_generate(params)))
+
+				payload = {}
+				payload["cmd"] = "diffiehellman"
+				payload["key"] = @dh.public_key.to_pem
+
+				pubkey = @dh.pub_key
+				payload["pubkey"] = pubkey.to_s
+
+				payload = Base64.encode64(cipher.update(JSON.pretty_generate(payload)) + cipher.final)
+
+				cmd["params"] = params
+				cmd["payload"] = payload
+				write(@channel, JSON.pretty_generate(cmd))
+			elsif (data["cmd"] == "diffiepubkey") then
+				pubkey = OpenSSL::BN.new(data["key"], 16)
+				@symmkey = @dh.compute_key(pubkey)
+				@client.setup_encryption(@symmkey, @iv)
+
+				@client.connect_channel(@channel, Harness::CommandChannelServer.new(@channel, @client))
+			else
+				puts "Invalid command #{indata}"
+				write(@channel, JSON.pretty_generate("cmd" => "upgrade", "to" => "keys"))
+			end
+		end
+
+		def write(channel, data)
+			@client.write(channel, data)
+		end
+	end
+
+	class KeyClient
+		def initialize(channel, client, key)
+			@client = client
+			@key = key
+			@channel = channel
+			@on_connect = nil
+			@symmkey = nil
+			@iv = nil
+		end
+
+		def on_connect(&blk)
+			@on_connect = blk
+		end
+
+		def read(channel, indata)
+			data = JSON.parse(indata)
+			if (data["cmd"] == "encrypted") then
+				key_fingerprint = data["key"]
+				raise "Key mismatch" if key_fingerprint != Digest::SHA1.hexdigest(@key.public_key.to_der)
+				params = Base64.decode64(data["params"])
+				params = @key.private_decrypt(params)
+				params = JSON.parse(params)
+				cipher = OpenSSL::Cipher::AES256.new(:CBC)
+				cipher.decrypt
+				cipher.key = Base64.decode64(params["key"])
+				@iv = Base64.decode64(params["iv"])
+				cipher.iv = @iv
+
+
+				payload = data["payload"]
+				payload = Base64.decode64(payload)
+				payload = cipher.update(payload) + cipher.final
+				payload = JSON.parse(payload)
+
+				if (payload["cmd"] == "diffiehellman") then
+					dh = OpenSSL::PKey::DH.new(payload["key"])
+					dh.generate_key!
+					@symmkey = dh.compute_key(OpenSSL::BN.new(payload["pubkey"]))
+
+					cmd = {}
+					cmd["cmd"] = "diffiepubkey"
+					cmd["key"] = dh.pub_key.to_s(16)
+					write(@channel, JSON.pretty_generate(cmd))
+					@client.setup_encryption(@symmkey, @iv)
+
+
+					@client.on_drain {
+						@client.connect_channel(@channel, Harness::CommandChannelClient.new(@channel, @client))
+						@on_connect.call if @on_connect
+						@client.on_drain{}
+					}					
+				else
+					raise "Unknown cmd #{indata}"
+				end
+			else
+				raise "Unknown cmd #{indata}"
+			end
+		end
+
+		def start_key_negotiation
+			cmd = {}
+			cmd["cmd"] = "key"
+			cmd["key"] = @key.public_key.to_pem
+			write(@channel, JSON.pretty_generate(cmd))
+		end
+
+		def write(channel, data)
+			@client.write(channel, data)
 		end
 	end
 
@@ -315,6 +460,10 @@ module Harness
 			result = to_io.read_nonblock(1024)
 			raise "No data" if result.nil? || result.empty?
 
+			if (@dec_cipher) then
+				result = @dec_cipher.update(result) if @dec_cipher
+			end
+
 			@buffer = "#{@buffer}#{result}"
 
 			while (@buffer.length > 4) do
@@ -327,7 +476,7 @@ module Harness
 					@buffer = @buffer[length + 4..-1]
 					read_channel(channel, data)
 				else
-					raise "Invalid read event"
+					break
 				end
 			end
 		end
@@ -359,6 +508,20 @@ module Harness
 			@channels ||= {}
 			@channels[channelno] = channel
 		end
+
+		def setup_encryption(key, iv)
+			@enc_cipher = OpenSSL::Cipher.new('aes-256-gcm')
+			@enc_cipher.encrypt
+			@enc_cipher.key = key
+			@enc_cipher.iv = iv
+
+			@dec_cipher = OpenSSL::Cipher.new('aes-256-gcm')
+			@dec_cipher.decrypt
+			@dec_cipher.key = key
+			@dec_cipher.iv = iv
+
+			puts "This connection is now encrypted using 256bit AES"
+		end
 	end
 
 	class ServerClient < CommonClient
@@ -368,6 +531,11 @@ module Harness
 			@channels = {}
 			@pump = nil
 			@verbose = false
+			@on_drain = nil
+		end
+
+		def on_drain(&blk)
+			@on_drain = blk
 		end
 
 		def verbose=(val)
@@ -379,6 +547,7 @@ module Harness
 			result = @sock.write_nonblock(@write_buffer)
 			if (result == @write_buffer.length)
 				@write_buffer = ""
+				@on_drain.call(self) if @on_drain
 			else
 				@write_buffer = @write_buffer[result..-1]
 			end
@@ -395,6 +564,9 @@ module Harness
 		end
 
 		def write_impl(data)
+			if (@enc_cipher) then
+				data = @enc_cipher.update(data)
+			end
 			@write_buffer = "#{@write_buffer}#{data}"
 		end
 
@@ -413,6 +585,11 @@ module Harness
 			@write_buffer = ""
 			@pump = nil
 			@verbose = nil
+			@on_drain = nil
+		end
+
+		def on_drain(&blk)
+			@on_drain = blk
 		end
 
 		def verbose=(val)
@@ -424,13 +601,17 @@ module Harness
 			result = @client.write_nonblock(@write_buffer)
 			if (result == @write_buffer.length)
 				@write_buffer = ""
+				@on_drain.call(self) if @on_drain
 			else
-				@write_buffer = @write_buffer[result]
+				@write_buffer = @write_buffer[result..-1]
 			end
 			@pump = pump
 		end
 
 		def write_impl(data)
+			if (@enc_cipher) then
+				data = @enc_cipher.update(data)
+			end
 			@write_buffer = "#{@write_buffer}#{data}"
 		end
 
