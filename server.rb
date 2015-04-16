@@ -1,6 +1,6 @@
 require_relative 'lib.rb'
 
-raise "No such file 'allow.key'.  Each line is the SHA1 hash of the key to allow (see stdout on client start)" unless File.exist?("key.allow")
+raise "No such file 'key.allow'.  Each line is the SHA1 hash of the key to allow (see stdout on client start)" unless File.exist?("key.allow")
 
 if (!File.exist?("dh.key")) then
 	puts "Generating new Diffie-Hellman key, this may take a few moments"
