@@ -5,6 +5,7 @@ require 'pty'
 require 'digest'
 require 'openssl'
 require 'base64'
+require 'io/console'
 
 module Harness
 
@@ -13,6 +14,8 @@ module Harness
 			@io_list = []
 			@running = false
 			@verbose = false
+			@wc = WakeClient.new
+			add(@wc)
 		end
 		def verbose=(val)
 			@verbose = val
@@ -26,13 +29,28 @@ module Harness
 			puts "Removed #{io.class}, now at #{@io_list.length}" if @verbose
 		end
 
+		def wake
+			@wc.wake
+		end
+
 		def run
 			@running = true
 			while (@running) do
+				@io_list.delete_if{|sock| 
+					r = false
+					begin
+						r = (sock.closed? || sock.client.closed?)
+					rescue Exception=>e
+						puts "#{e.message} on #{sock}"
+						puts "#{e.backtrace.join("\n\t")}"
+					end
+					r
+				}
+				break if @io_list.size == 1
+
 				write_list = @io_list.select{|sock| sock.writeable?}
 				read_list = @io_list.select{|sock| sock.readable?}
-				rl, wl = IO.select(read_list, write_list, [], 5)
-
+				rl, wl = IO.select(read_list, write_list, [], 1)
 				if (rl)
 					rl.each{|sock|
 						puts "[#{Time.now}] READ event on #{sock.class}" if @verbose
@@ -46,11 +64,52 @@ module Harness
 						sock.do_write(self)
 					}
 				end
+				@io_list.select{|dev| dev.respond_to?(:tick)}.each{|dev| dev.tick}
 			end
 		end
 
 		def stop
 			@running = false
+		end
+	end
+
+	class WakeClient
+		def initialize
+			rd, wr = IO.pipe
+			@rd = rd
+			@wr = wr
+		end
+
+		def wake
+			@wr.write("\0")
+		end
+
+		def client
+			self
+		end
+
+		def do_read(pump)
+			begin
+				r = @rd.read_nonblock(1024)
+			rescue Exception=>e
+
+			end
+		end
+
+		def writeable?
+			false
+		end
+
+		def closed?
+			false
+		end
+
+		def readable?
+			true
+		end
+
+		def to_io
+			@rd
 		end
 	end
 
@@ -62,8 +121,16 @@ module Harness
 			@verbose = false
 		end
 
+		def closed?
+			false
+		end
+
 		def writeable?
 			false
+		end
+
+		def client
+			self
 		end
 
 		def readable?
@@ -239,12 +306,24 @@ module Harness
 	class CommandChannelServer
 		def initialize(channel, client)
 			@client = client
+			@last = Time.now
+			@last_pong = Time.now
+		end
+
+		def tick
+			if (Time.now - @last > 5) then
+				@last = Time.now
+				write(0, JSON.pretty_generate({"cmd" => "ping"}))
+			end
+			if (Time.now - @last_pong > 15) then
+				puts "No pong for 15s, goodbye"
+				@client.close
+			end
 		end
 
 		def read(channel, indata)
 			data = JSON.parse(indata)
 			if (data["cmd"] == "execute") then
-
 				args = data["args"]
 
 				output, input, pid = PTY.spawn(*args)
@@ -257,7 +336,8 @@ module Harness
 				write(0, JSON.pretty_generate(odata))
 
 				stdout_channel = IOChannel.new(1, @client)
-				pipe = PipeToChannel.new(output, stdout_channel)
+				pipe = PipeToChannel.new(output, stdout_channel, @client)
+				@client.connect_channel(1, pipe)
 				@client.pump.add(pipe)
 
 				odata["cmd"] = "newchannel"
@@ -266,9 +346,26 @@ module Harness
 				odata["index"] = 2
 				write(0, JSON.pretty_generate(odata))
 
-				pipe = ChannelToPipe.new(input)
+				pipe = ChannelToPipe.new(input, @client)
 				@client.connect_channel(2, pipe)
 				@client.pump.add(pipe)
+
+				odata["cmd"] = "newchannel"
+				odata["name"] = "ptycntrl"
+				odata["type"] = "pty"
+				odata["index"] = 3
+				write(0, JSON.pretty_generate(odata))
+
+				puts "Creating new channel"
+
+				pipe = PtyCommandChannel.new(input: input, output: output, pid: pid, client: @client)
+				@client.connect_channel(3, pipe)
+			elsif (data["cmd"] == "closechannel") then
+				@client.drop_channel(data["index"])
+			elsif (data["cmd"] == "ping") then
+				write(0, JSON.pretty_generate({"cmd" => "pong"}))
+			elsif (data["cmd"] == "pong") then
+				@last_pong = Time.now
 			else
 				puts "Unrecognized data #{indata}"
 			end
@@ -290,6 +387,19 @@ module Harness
 	class CommandChannelClient
 		def initialize(channel, client)
 			@client = client
+			@last = Time.now
+			@last_pong = Time.now
+		end
+
+		def tick
+			if (Time.now - @last > 5) then
+				@last = Time.now
+				write(0, JSON.pretty_generate({"cmd" => "ping"}))
+			end
+			if (Time.now - @last_pong > 15) then
+				puts "No pong for 15s, goodbye"
+				@client.close
+			end
 		end
 
 		def read(channel, indata)
@@ -302,7 +412,7 @@ module Harness
 				if (data["type"] == "out") then
 					#puts "***** CONNECTING NEW PIPE FOR #{data["name"]}"
 					
-					pipe = ChannelToPipe.new(pipe)
+					pipe = ChannelToPipe.new(pipe, @client)
 
 					pipe.verbose = true
 
@@ -311,11 +421,30 @@ module Harness
 				elsif (data["type"] == "in") then
 					#puts "***** CONNECTING NEW PIPE FOR #{data["name"]}"
 					channel = IOChannel.new(data["index"], @client)
-					pipe = PipeToChannel.new(pipe, channel)
+					pipe = PipeToChannel.new(pipe, channel, @client)
+					@client.connect_channel(data["index"], pipe)
 					@client.pump.add(pipe)
+				elsif (data["type"] == "pty")
+					pipe = PtyControlChannel.new(data["index"], client: @client)
+					@client.connect_channel(data["index"], pipe)
 				end
 			elsif (data["cmd"] == "closechannel") then
 				@client.drop_channel(data["index"])
+
+				if (data["index"] > 0) then
+					@client.deliver_signal("TERM")
+					@client.close_channel(1) if data["index"] != 1
+					@client.close_channel(2) if data["index"] != 2
+					@client.close_channel(3) if data["index"] != 3
+				end
+
+				if (@client.channels.size == 1) then
+					@client.close_channel(0)
+				end
+			elsif (data["cmd"] == "ping") then
+				write(0, JSON.pretty_generate({"cmd" => "pong"}))
+			elsif (data["cmd"] == "pong") then
+				@last_pong = Time.now
 			else
 				puts "Unrecognized data #{indata}"
 			end
@@ -335,8 +464,58 @@ module Harness
 
 	end
 
+	class PtyCommandChannel
+		def initialize(input: nil, output: nil, pid: nil, client: nil)
+			@channel = nil
+			@input = input
+			@output = output
+			@pid = pid
+			@client = client
+		end
+
+		def on_channel_connect(client, channel)
+			@client = client
+			@channel = channel
+			client.write(channel, JSON.pretty_generate({"cmd" => "gettermsize"}))
+		end
+
+		def read(channel, data)
+			data = JSON.parse(data)
+			if (data["cmd"] == "deliversignal") then
+				s =  "[SRVR] Sending #{data["signal"]} to #{@pid}\n" 
+				print s
+				@client.write(1, s) unless @client.channels[1].nil?
+				Process.kill(data["signal"], @pid)
+			elsif (data["cmd"] == "settermsize") then
+				@output.winsize = data["size"]
+			end
+		end
+	end
+
+	class PtyControlChannel
+		def initialize(channel, client: nil)
+			@channel = channel
+			@client = client
+		end
+
+		def read(channel, data)
+			data = JSON.parse(data)
+			if (data["cmd"] == "gettermsize") then
+				send_term_size
+			end
+		end
+
+		def send_term_size
+			@client.write(@channel, JSON.pretty_generate({"cmd" => "settermsize", "size" => $stdout.winsize}))
+		end
+
+		def deliver_signal(sig)
+			@client.write(@channel, JSON.pretty_generate({"cmd" => "deliversignal", "signal" => sig.to_s.upcase}))
+		end
+	end
+
 	class ChannelToPipe
-		def initialize(io, insert_cr: false, output_file: nil)
+		def initialize(io, client, insert_cr: false, output_file: nil)
 			@io = io
 			@write_buffer = ""
 			@insert_cr = insert_cr
@@ -346,6 +525,20 @@ module Harness
 				@f.sync = true
 			end
 			@verbose = false
+			@closed = false
+			@client = client
+		end
+
+		def client
+			@client
+		end
+
+		def closed?
+			@closed
+		end
+
+		def close
+			@closed = true
 		end
 
 		def verbose=(val)
@@ -399,6 +592,10 @@ module Harness
 			@channel = channel
 		end
 
+		def channel
+			@channel
+		end
+
 		def close(io)
 			@client.pump.remove(io)
 			@client.close_channel(@channel)
@@ -410,9 +607,23 @@ module Harness
 	end
 
 	class PipeToChannel
-		def initialize(io, channel)
+		def initialize(io, channel, client)
 			@io = io
 			@channel = channel
+			@closed = false
+			@client = client
+		end
+
+		def client
+			@client
+		end
+
+		def closed?
+			@closed
+		end
+
+		def close
+			@closed = true
 		end
 
 		def readable?
@@ -423,10 +634,14 @@ module Harness
 			begin
 				result = to_io.read_nonblock(1024)
 				@channel.write(result)
-
 				#puts "CHAN #{@channel} READ #{result}"
+			rescue EOFError=>e
+				@channel.close(self)				
 			rescue Exception=>e
-				puts "Channel closed #{@channel} closed!"
+				puts "Channel closed #{@channel} (#{@channel.channel}) closed!"
+				puts "#{e.class} - #{e.message}"
+				puts "#{e.backtrace.join("\n\t")}"
+
 				@channel.close(self)
 			end
 		end
@@ -445,7 +660,23 @@ module Harness
 			true
 		end
 
+		def closed?
+			@closed
+		end
+
+
+		def tick
+			@channels.each{|chan, channel|
+				if (channel.respond_to?(:tick)) then
+					channel.tick
+				end
+			}			
+		end
+
 		def write(channel, data)
+			if (@channels[channel].nil?) then
+				raise "Cannot write #{data.length}B (#{data}) to #{channel}"
+			end
 			newdata = [channel].pack("S")
 
 			newdata = "#{newdata}#{data}"
@@ -456,42 +687,49 @@ module Harness
 		end
 
 		def do_read(pump)
-			@buffer ||= ""
-			result = to_io.read_nonblock(1024)
-			raise "No data" if result.nil? || result.empty?
+			return if closed?
+			begin
+				@buffer ||= ""	
+				result = to_io.read_nonblock(1024)
+				raise "No data" if result.nil? || result.empty?
 
-			if (@dec_cipher) then
-				result = @dec_cipher.update(result) if @dec_cipher
-			end
-
-			@buffer = "#{@buffer}#{result}"
-
-			while (@buffer.length > 4) do
-				length = @buffer[0..4]
-				length = length.unpack("L").first
-
-				if (@buffer.length >= length + 4) then
-					channel = @buffer[4, 2].unpack("S").first
-					data = @buffer[6, length-2]
-					@buffer = @buffer[length + 4..-1]
-					read_channel(channel, data)
-				else
-					break
+				if (@dec_cipher) then
+					result = @dec_cipher.update(result) if @dec_cipher
 				end
+
+				@buffer = "#{@buffer}#{result}"
+
+				while (@buffer.length > 4) do
+					length = @buffer[0..4]
+					length = length.unpack("L").first
+
+					if (@buffer.length >= length + 4) then
+						channel = @buffer[4, 2].unpack("S").first
+						data = @buffer[6, length-2]
+						@buffer = @buffer[length + 4..-1]
+						read_channel(channel, data)
+					else
+						break
+					end
+				end
+			rescue EOFError=>e
+				@closed = true
 			end
 		end
 
 		def read_channel(channel, data)
 			@channels ||= {}
-			raise "No connected channel #{channel}" unless @channels.include?(channel)
+			raise "No connected channel #{channel} -  data is #{data} (#{data.length})" unless @channels.include?(channel)
 			@channels[channel].read(channel, data)
+		end
+
+		def channels
+			@channels
 		end
 
 		def close_channel(channelno)
 			@channels ||= {}
-			if (channelno != 0) then
-				@channels[0].send_closed_channel(channelno)
-			end
+			@channels[0].send_closed_channel(channelno)
 			drop_channel(channelno)
 		end
 
@@ -502,11 +740,21 @@ module Harness
 			pump.remove(c) unless c.nil?
 
 			@channels.delete(channelno)
+
+			if (@channels.empty?) then
+				@closed = true
+				to_io.close
+			end
+		end
+
+		def client
+			self
 		end
 
 		def connect_channel(channelno, channel)
 			@channels ||= {}
 			@channels[channelno] = channel
+			channel.on_channel_connect(self, channelno) if channel.respond_to?(:on_channel_connect)
 		end
 
 		def setup_encryption(key, iv)
@@ -532,6 +780,7 @@ module Harness
 			@pump = nil
 			@verbose = false
 			@on_drain = nil
+			@closed = false
 		end
 
 		def on_drain(&blk)
@@ -585,11 +834,22 @@ module Harness
 			@write_buffer = ""
 			@pump = nil
 			@verbose = nil
-			@on_drain = nil
+			@on_drain = []
+			@closed = false
 		end
 
 		def on_drain(&blk)
-			@on_drain = blk
+			@on_drain.push blk
+		end
+
+		def prompt
+
+		end
+
+		def deliver_signal(signal)
+			pty = channels[3]
+			return false if pty.nil?
+			pty.deliver_signal(signal)
 		end
 
 		def verbose=(val)
@@ -601,7 +861,10 @@ module Harness
 			result = @client.write_nonblock(@write_buffer)
 			if (result == @write_buffer.length)
 				@write_buffer = ""
-				@on_drain.call(self) if @on_drain
+				while (!@on_drain.empty?) do
+					blk = @on_drain.shift
+					blk.call(self)
+				end
 			else
 				@write_buffer = @write_buffer[result..-1]
 			end

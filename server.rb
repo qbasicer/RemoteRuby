@@ -15,6 +15,8 @@ server = Harness::Server.new(2000)
 
 pump = Harness::IOPump.new
 
+
+
 server.on_connect{|socket|
 	socket.pump = pump
 	socket.connect_channel(0, Harness::KeyServer.new(0, socket))
@@ -22,5 +24,7 @@ server.on_connect{|socket|
 }
 
 pump.add(server)
+
+puts "Server started, ready for connections"
 
 pump.run
